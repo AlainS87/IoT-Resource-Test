@@ -1,0 +1,57 @@
+# ----------------- Stage 1: build publisher app -----------------
+FROM golang:1.24.2 AS builder
+
+# Work at the module root so go.mod/go.sum are detected
+WORKDIR /src
+
+# Pull deps first for better layer caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Bring in the rest of the source
+COPY . .
+
+# Build the publisher binary
+# (Optional) static build: uncomment the next two lines for a smaller runtime
+# ENV CGO_ENABLED=0
+# RUN go build -trimpath -ldflags="-s -w" -o /out/main ./mqtt_marine/pub_only_client
+RUN go build -o /out/main ./mqtt_marine/pub_only_client
+
+
+# ----------------- Stage 2: runtime -----------------
+FROM archlinux:latest
+USER root
+
+# Update base and install only what the publisher needs at runtime
+# NOTE: Do NOT overwrite /etc/resolv.conf during build (often read-only)
+RUN pacman -Syu --noconfirm && \
+    pacman -S --noconfirm --needed \
+        bash curl tzdata iproute2 procps tcpdump lsof vim tree && \
+    ln -sf /usr/share/zoneinfo/UTC /etc/localtime && \
+    echo "UTC" > /etc/timezone && \
+    pacman -Scc --noconfirm
+
+# Copy built artifact
+RUN mkdir -p /root/app
+COPY --from=builder /out/main /root/app/main
+
+# Copy optional wrapper script (if present)
+COPY mqtt_marine/pub_only_client/mqtt-bench.sh /root/app/mqtt-bench.sh
+RUN [ -f /root/app/mqtt-bench.sh ] && chmod +x /root/app/mqtt-bench.sh || true
+
+# Copy sample message payloads (adjust if your repo differs)
+COPY mqtt_marine/pub_only_client/sample_msg/Buoy_028 \
+     /root/app/sample_msg/Buoy_028
+
+# Environment and PATH
+ENV TZ=UTC
+ENV PATH="/root/app:${PATH}"
+
+WORKDIR /root/app
+
+# Choose your default entry (uncomment one):
+# 1) Run the Go publisher directly (configure via flags/env)
+# ENTRYPOINT ["/root/app/main"]
+
+# 2) Use the wrapper to orchestrate flags/env/logging and wait for broker
+ENTRYPOINT ["/root/app/mqtt-bench.sh"]
