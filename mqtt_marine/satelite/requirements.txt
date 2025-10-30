@@ -1,0 +1,16 @@
+keras==2.9.0
+tensorflow==2.9.1
+numpy==1.22.3
+scipy
+paho-mqtt
+xarray
+geopandas
+pandas
+shapely
+scikit-learn
+joblib
+pyyaml
+loguru
+matplotlib
+seaborn
+requests

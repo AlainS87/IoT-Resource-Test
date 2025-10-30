@@ -1,0 +1,85 @@
+# ------------------------- Stage 1: Build Go controller -------------------------
+FROM golang:1.24.2 AS builder
+
+# Work at module root so go.mod/go.sum are detected
+WORKDIR /src
+
+# Better caching: deps first
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Bring in the rest of the source
+COPY . .
+
+# Build the satellite controller (Go) located at ./mqtt_marine/satelite
+# (Optional: static build -> uncomment CGO_ENABLED and ldflags)
+# ENV CGO_ENABLED=0
+# RUN go build -trimpath -ldflags="-s -w" -o /out/main ./mqtt_marine/satelite
+RUN go build -o /out/main ./mqtt_marine/satelite
+
+
+# -------------------- Stage 2: Python + Mosquitto runtime --------------------
+FROM python:3.10-slim AS final
+
+# Keep app under /root/app
+WORKDIR /root/app
+
+# Install Python deps + system tools + Mosquitto broker and clients
+# Note: do NOT try to overwrite /etc/resolv.conf; it's read-only in many builders.
+COPY mqtt_marine/satelite/requirements.txt ./requirements.txt
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      tzdata iproute2 procps tcpdump curl \
+      mosquitto mosquitto-clients \
+      tini && \
+    pip install --no-cache-dir -r requirements.txt && \
+    ln -sf /usr/share/zoneinfo/UTC /etc/localtime && \
+    echo "UTC" > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
+ENV TZ=UTC
+
+# ----------------------------- ML/model code assets -----------------------------
+COPY mqtt_marine/satelite/rouge_wave_model/ ./rouge_wave_model/
+# If you have more models, copy them similarly:
+# COPY mqtt_marine/satelite/fire_forecast_model/ ./fire_forecast_model/
+
+# ----------------------------- Go controller binary -----------------------------
+COPY --from=builder /out/main /root/app/main
+RUN chmod +x /root/app/main
+
+# ----------------------------- Mosquitto configuration --------------------------
+# 1) Provide a safe default config (allows anonymous on 1883 for dev/test)
+#    This will be overwritten by the COPY below if your repo has a config file.
+RUN mkdir -p /etc/mosquitto /var/lib/mosquitto && \
+    printf "listener 1883 0.0.0.0\nallow_anonymous true\n" > /etc/mosquitto/mosquitto.conf
+
+# 2) If you already have a repo config (recommended), copy it to override the default.
+#    Comment this line if you don't have that file in your repo.
+COPY mqtt_marine/broker/mosquitto.conf /etc/mosquitto/mosquitto.conf
+
+# ------------------------------- Wrapper (optional) ------------------------------
+# If you use a shell wrapper to orchestrate Python compute + publish, copy it:
+COPY mqtt_marine/satelite/mqtt-bench.sh /root/app/mqtt-bench.sh
+
+RUN chmod +x /root/app/mqtt-bench.sh /root/app/main
+
+# ------------------------------- Entrypoint script -------------------------------
+# Start Mosquitto in the background, then exec the Go controller.
+# tini is used as PID 1 to handle signals and reap zombies.
+RUN printf '%s\n' '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'mosquitto -c /etc/mosquitto/mosquitto.conf -v &' \
+  'MOSQ_PID=$!' \
+  'term(){ kill -TERM "$MOSQ_PID" 2>/dev/null || true; }' \
+  'trap term SIGTERM SIGINT' \
+  'exec /root/app/main "$@"' \
+  > /usr/local/bin/start-satellite.sh && \
+  chmod +x /usr/local/bin/start-satellite.sh
+
+ENV PATH="/root/app:${PATH}"
+
+# Expose MQTT port (and add more if your controller serves HTTP, etc.)
+EXPOSE 1883
+
+# Use tini as the init, then our start script
+ENTRYPOINT ["/root/app/mqtt-bench.sh"]

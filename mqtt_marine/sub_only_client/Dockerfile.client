@@ -1,0 +1,38 @@
+# ----------------- Stage 1: build subscriber app -----------------
+FROM golang:1.24.2 AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+# (Optional static build)
+# ENV CGO_ENABLED=0
+# RUN go build -trimpath -ldflags="-s -w" -o /out/main ./mqtt_marine/sub_only_client
+RUN go build -o /out/main ./mqtt_marine/sub_only_client
+
+
+# ----------------- Stage 2: runtime -----------------
+FROM archlinux:latest
+USER root
+
+# Minimal runtime; DO NOT touch /etc/resolv.conf
+RUN pacman -Syu --noconfirm && \
+    pacman -S --noconfirm --needed \
+      bash curl tzdata ca-certificates && \
+    ln -sf /usr/share/zoneinfo/UTC /etc/localtime && \
+    echo "UTC" > /etc/timezone && \
+    pacman -Scc --noconfirm
+
+# App files
+RUN mkdir -p /root/app
+COPY --from=builder /out/main /root/app/main
+COPY mqtt_marine/sub_only_client/mqtt-bench.sh /root/app/mqtt-bench.sh
+RUN chmod +x /root/app/main /root/app/mqtt-bench.sh
+
+ENV TZ=UTC
+ENV PATH="/root/app:${PATH}"
+WORKDIR /root/app
+
+# Use wrapper: waits for broker then starts subscriber
+ENTRYPOINT ["/root/app/mqtt-bench.sh"]
